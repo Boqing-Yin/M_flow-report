@@ -1,80 +1,51 @@
 # M_flow架构解析
 
-## "三相"的推理机制
-### Architecture
+## 总括
 
-| Term            | Definition                                                     | Example                                     |
-| --------------- | -------------------------------------------------------------- | ------------------------------------------- |
-| **Three-phase** | Extract → Memorize → Load: the end-to-end pipeline in M-Flow   | Data moves through all three stages         |
-| **Extract**     | Ingestion: parse, normalize, and chunk raw inputs              | PDF parsing, text chunking                  |
-| **Memorize**    | Graph construction: extract entities, relations, and hierarchy | NER, triplet extraction, episodic structure |
-| **Load**        | Retrieval: hybrid search and ranking over graph and vectors    | Semantic recall, graph traversal            |
-摄取 + 记忆 + 提取
-三相路径
-## 四个层级的记忆粒度
+> 本章为后续章节（第3~7章）构建一个全局视野，帮助读者在深入细节之前，先把握 M-Flow 的整体架构脉络。
 
-| Node           | Granularity | Description                             | Example label                        |
-| -------------- | ----------- | --------------------------------------- | ------------------------------------ |
-| **Episode**    | Coarse      | One coherent event or document          | “Q1 strategy review”                 |
-| **Facet**      | Medium      | One theme or section within the episode | “Technical decisions”                |
-| **FacetPoint** | Fine        | One concrete, retrievable point         | “We chose Neo4j for the graph layer” |
-| **Entity**     | —           | Names and concepts tied to the episode  | People, products, orgs               |
+### 一、核心 Pipeline 与 Stage 机制
 
-并非简单的记忆平铺展开，而是形成了类似人的记忆推理机制的四层级图网络。可以达到“见微知著”的效果。
-## 数据集属性
-| Field  领域/范围  | Type  类型/种类 | Description  描述            |
-| ------------- | ----------- | -------------------------- |
-| `id`          | UUID        | Primary key                |
-| `name`        | string      | Unique human-readable name |
-| `description` | string      | Optional description       |
-| `created_at`  | timestamp   | Creation time              |
-| `owner_id`    | UUID        | Owning user (multi-tenant) |
+M-Flow 的所有数据处理指令——无论是数据摄入（`add`）、记忆构建（`memorize`）还是其他操作——都建立在统一的 **Pipeline（管线）** 与 **Stage（阶段）** 执行引擎之上。
 
-为隐私接入，还有数据集划分提供了条件。
+- **Pipeline** 是一条"加工流水线"，将一系列有序的处理步骤串联起来，原始数据从一端流入，经过每个 Stage 的变换，最终输出处理结果。
+- **Stage** 是 Pipeline 中的最小执行单元，它将任意可调用函数（同步/异步/生成器）包装为统一接口，支持参数预置、并发控制和分批处理。
 
-## 高度定制化的搜索需求
-搜索可以通过下面几个维度进行定制。
+这套机制将在 **[第三章](report/chapter3.md)** 中详细展开，涵盖 Pipeline 的执行引擎（`execute_workflow()`）、分批处理策略、并发控制（SQLite 串行 vs PostgreSQL 20 并发）以及 Stage 链的数据流传递方式。
 
-| Parameter      | Type       | Description                                    | Default            |
-| -------------- | ---------- | ---------------------------------------------- | ------------------ |
-| `query_text`   | string     | The search query                               | Required           |
-| `query_type`   | RecallMode | Recall mode                                    | TRIPLET_COMPLETION |
-| `datasets`     | list[str]  | Datasets to search                             | All datasets       |
-| `top_k`        | int        | Number of results to return                    | 10                 |
-| `collections`  | list[str]  | Restrict vector search to specific collections | All collections    |
-| `only_context` | bool       | Return context only (skip LLM answer)          | False              |
+### 二、三大核心指令：`add` / `memorize` / `search`
 
-使用示例：
-```python
-import m_flow
+M-Flow 对外暴露了三个最核心的操作指令，它们构成了"**摄入 → 记忆化 → 检索**"的完整数据生命周期：
 
-results = await m_flow.search(
-    query_text="technology selection criteria",
-    query_type=m_flow.RecallMode.EPISODIC,
-    datasets=["meeting_notes"],
-    top_k=5,
-    only_context=True
-)
-```
-## 五种RecallMode展示
-### EPISODIC
+| 指令 | 职责 | 对应章节 |
+|------|------|---------|
+| **`add`** | 将原始数据摄入系统，建立 Data 记录并关联到指定数据集 | [第四章](report/chapter4.md) |
+| **`memorize`** | 对已摄入的数据进行深度处理，构建结构化的知识图谱记忆层 | [第五章](report/chapter5.md) |
+| **`search`** | 基于查询文本，从已构建的记忆网络中检索相关信息 | [第七章](report/chapter7.md) |
 
-Best for: events, meetings, document contents.
+这三个指令虽然都基于 Pipeline 机制，但各自的执行逻辑有本质区别：
 
-### PROCEDURAL
+1. **`add`（数据摄入）** — 最轻量的指令，仅包含 2 个 Stage：`resolve_data_directories()`（目录展开）和 `ingest_data()`（数据摄入）。核心职责是将原始数据保存并建立 Data 记录，不涉及向量化或知识抽取。详见 **[第四章](report/chapter4.md)**。
 
-> **Experimental** — Procedural retrieval is currently in testing. Please understand the parsing and usage patterns thoroughly before deploying to production. Improper use may affect ingestion data quality, model response time, and output quality.
+2. **`memorize`（记忆构建）** — 最复杂的指令，包含 8 个 Stage 的深度处理管线：文档分类 → 语义分块 → 句子级内容路由 → 摘要封装 → 情景记忆构建 → 持久化存储 → 实体关联边 → Facet-Entity 边。最终将原始文本转化为由 Episode、Facet、Entity 等节点及其语义边构成的知识图谱子图。详见 **[第五章](report/chapter5.md)**。
 
-Best for: step-by-step instructions, installation guides.
+3. **`search`（记忆检索）** — 与 `add`/`memorize` 的 Pipeline 机制不同，搜索系统采用**分层调度架构**，不经过 Stage 执行引擎，而是直接路由到对应的检索器。它支持五种搜索模式：`TRIPLET_COMPLETION`（三元组问答）、`EPISODIC`（情景检索）、`PROCEDURAL`（流程检索）、`CYPHER`（直接图查询）和 `CHUNKS_LEXICAL`（词法匹配）。详见 **[第七章](report/chapter7.md)**。
 
-### TRIPLET_COMPLETION
+### 三、存储模式
 
-Best for: entity relationships, questions requiring an LLM-generated answer.
+M-Flow 的记忆存储采用**三库协同**的架构策略，三种数据库各司其职，共同构成完整的记忆存储体系：
 
-### CHUNKS_LEXICAL
+| 数据库类型 | 存储内容 | 默认后端 | 生产后端 |
+|-----------|---------|---------|---------|
+| **图数据库** | 记忆的知识网络（节点 + 边） | Kùzu | Neo4j / Amazon Neptune |
+| **向量数据库** | 文本的向量嵌入（语义索引） | ChromaDB | Milvus / Qdrant / Pinecone |
+| **关系型数据库** | 元数据（用户、数据集、Data 记录、操作日志） | SQLite | PostgreSQL |
 
-Best for: exact keyword matching.
+- **图数据库** 存储记忆的网络结构，包含 Episode（情景）、Facet（事实面）、Entity（实体）、FacetPoint（细粒度事实点）等节点类型，以及 `has_facet`、`involves_entity`、`same_entity_as` 等语义边。
+- **向量数据库** 按 `(节点类型_字段名)` 的规则分组索引，为每个需要语义搜索的字段建立独立的向量集合，支持细粒度的语义检索。
+- **关系型数据库** 存储所有结构化元数据，包括用户信息、数据集归属、原始 Data 记录以及图操作审计日志。
 
-### CYPHER
+存储模式的详细设计将在 **[第六章](report/chapter6.md)** 中深入解析，包括各数据库的表结构/节点定义、适配器模式（`GraphProvider` / `VectorProvider`）、两阶段持久化策略以及完整的数据存储示例。
 
-Best for: complex graph traversals.
+---
+

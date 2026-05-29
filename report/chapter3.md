@@ -1,194 +1,381 @@
-# 本地部署情况报告
-## 基本部署信息
+# M-flow Pipeline 与 Stage 机制说明
 
-| **Python**    | 3.12.3（虚拟环境）   |
-| ------------- | -------------- |
-| **OS**        | Linux          |
-| **RAM**       | 4 GB           |
-| **LLM**       | DeepSeek/v4pro |
-| **EMBEDDING** | fastembed      |
+## 概述
 
+本文档独立说明 M-flow 中 Pipeline（管线）和 Stage（阶段）的通用机制，不涉及具体业务指令。这是理解 `add`、`memorize` 等所有指令如何被编排执行的基础。
 
-## 测试结果展示
-### tset1-基础连接测试：
-- 测试文件
+---
+
+## 目录
+
+- [一、核心概念](#一核心概念)
+  - [1.1 Pipeline（管线）](#11-pipeline管线)
+  - [1.2 Stage（阶段）](#12-stage阶段)
+  - [1.3 Stage 的实例化方式](#13-stage-的实例化方式)
+- [二、Pipeline 的执行引擎](#二pipeline-的执行引擎)
+  - [2.1 `execute_workflow()` — 管线入口](#21-execute_workflow--管线入口)
+  - [2.2 执行流程](#22-执行流程)
+  - [2.3 各步骤职责](#23-各步骤职责)
+- [三、分批处理机制](#三分批处理机制)
+  - [3.1 为什么需要分批？](#31-为什么需要分批)
+  - [3.2 分批实现](#32-分批实现)
+- [四、并发控制机制](#四并发控制机制)
+  - [4.1 三种执行模式](#41-三种执行模式)
+  - [4.2 并发数决定逻辑](#42-并发数决定逻辑)
+  - [4.3 两层控制关系](#43-两层控制关系)
+- [五、Stage 的执行方式](#五stage-的执行方式)
+  - [5.1 `process_data_items()` — 对单个 item 执行所有 Stage](#51-process_data_items--对单个-item-执行所有-stage)
+  - [5.2 Stage 链的数据流](#52-stage-链的数据流)
+- [六、典型 Pipeline 示例](#六典型-pipeline-示例)
+  - [6.1 `add` Pipeline（数据摄入）](#61-add-pipeline数据摄入)
+  - [6.2 `memorize` Pipeline（记忆化处理）](#62-memorize-pipeline记忆化处理)
+  - [6.3 自定义 Pipeline](#63-自定义-pipeline)
+- [七、设计要点总结](#七设计要点总结)
+
+---
+
+## 一、核心概念
+
+### 1.1 Pipeline（管线）
+
+Pipeline 是 M-flow 中**对数据进行一系列有序处理的编排框架**，类似于一条"加工流水线"。
+
+```
+原始数据 ──→ Stage 1 ──→ Stage 2 ──→ Stage 3 ──→ 处理结果
+（PDF）     （分块）     （向量化）    （存入图库）
+```
+
+每个 **Stage（阶段）** 是一个处理步骤，多个 Stage 串联成一个 Pipeline。
+
+### 1.2 Stage（阶段）
+
+`Stage` 是一个统一的任务包装器，可以将任何可调用对象标准化为统一的执行接口。
+
 ```python
-async def main():  
-    # 1. 写入我们设计的“连环线索”
-    await m_flow.add("小明最喜欢的运动是打篮球。")
-    await m_flow.add("小红在小明生日那天，送了他一件他最喜欢运动的装备。")
-    await m_flow.add("小刚送了小明一本书。")
-    # 2. 触发 M-Flow 整理并构建知识图谱（这一步会调用大模型）
-  
-    await m_flow.memorize()
-    # 3. 提问测试
-    question = "小红送给小明的生日礼物可能是什么？"
- 
-    # 4. 执行多跳图路由检索
-    results = await m_flow.search(question)
-    print("\n--- 检索到的相关记忆片段 ---")
+class Stage:
+    def __init__(self, fn, *defaults, config=None, **kw_defaults):
+        # fn: 要包装的函数
+        # *defaults: 预置的位置参数
+        # **kw_defaults: 预置的关键字参数
 ```
-- 根据三个线索（2 个有效，1 个干扰）：
-   `小明最喜欢的运动是打篮球`
-   `小红在小明生日那天，送了他一件他最喜欢运动的装备`
-   `小刚送了小明一本书`
-	输出了`篮球装备`的正确答案。
-- 输出约耗时`30s`
-### test2-针对性（监控图像情景）测试
-- 测试文件
+
+**支持的函数类型**：
+
+| 类型 | 说明 | 示例 |
+|------|------|------|
+| 同步函数 | 普通函数 | `def fn(item): ...` |
+| 异步函数 | async 函数 | `async def fn(item): ...` |
+| 生成器 | 逐个 yield 结果 | `def fn(items): yield ...` |
+| 异步生成器 | 异步逐个 yield | `async def fn(items): async yield ...` |
+
+### 1.3 Stage 的实例化方式
+
 ```python
-video_events = [
-        "时间：09:15 | 地点：东门 | 行人：P-101 | 特征：男性，蓝色卫衣 | 携带物品：棕色纸袋。",
-        "时间：10:00 | 地点：3号楼大堂 | 行人：P-101 | 特征：蓝色卫衣 | 携带物品：无。",
-        "时间：10:15 | 地点：3号楼大堂 | 发现遗留物：长椅上出现了一个无人看管的棕色纸袋。",
-        "时间：10:30 | 地点：3号楼大堂 | 行人：P-102 | 特征：女性，黄色外套 | 携带物品：带走了棕色纸袋。"
-    ]
+# 方式一：无预置参数
+Stage(resolve_data_directories, include_subdirectories=True)
 
-    # 2. 写入记忆
-    ...
-    # 3. 运行测试问题集
-    test_queries = [
-        "P-101在09:15时携带了什么物品？", # 难度1
-        "3号楼长椅上遗留的棕色纸袋最可能是谁落下的？", # 难度2
-        "棕色纸袋是在什么时间段内被遗落的？" # 难度3
-    ]
-	# 4. 输出结果
-	...
+# 方式二：预置后续参数
+Stage(ingest_data, ds_name, usr, nodes, ds_id, loader_cfg, created_at_ms)
+# 等价于：ingest_data(data, ds_name, usr, nodes, ds_id, loader_cfg, created_at_ms)
+# 其中 data 由管线引擎在运行时传入
 ```
-- 这是一个针对实际运用情景的试探性测试，设计了三个不同难度的问题，来让 M_flow 解答。
-- 回答结果展示如下：
+
+Stage 的 `*defaults` 和 `**kw_defaults` 参数会被预置到函数调用中，运行时管线引擎传入的 `data` 作为第一个参数。
+
+---
+
+## 二、Pipeline 的执行引擎
+
+### 2.1 `execute_workflow()` — 管线入口
+
+```python
+async def execute_workflow(tasks, data, datasets, user, name, config):
+    cfg = config or WorkflowConfig()
+    resolved_user, authorised = await _prepare(tasks, datasets, user, cfg)
+
+    for ds in authorised:
+        async for info in _execute_for_dataset(ds, resolved_user, tasks, data, name, cfg):
+            yield info
 ```
-===============================================
-P-101在09:15时携带了什么物品？(预期回答：棕色纸袋)
-召回线索 [1]: {'search_result': ['Context does not provide information about P-101 at 09:15.'], 'dataset_id': '9403e96c-b3b6-55f8-a052-06211dc305ce', 'dataset_name': 'main_dataset', 'dataset_tenant_id': None}
 
-===============================================
-3号楼长椅上遗留的棕色纸袋最可能是谁落下的？(预期回答：P-101)
-召回线索 [1]: {'search_result': ['最可能是行人P-102落下的。'], 'dataset_id': '9403e96c-b3b6-55f8-a052-06211dc305ce', 'dataset_name': 'main_dataset', 'dataset_tenant_id': None}
+### 2.2 执行流程
 
-===============================================
-棕色纸袋是在什么时间段内被遗落的？(预期回答：9:15-10:00)
-召回线索 [1]: {'search_result': ['棕色纸袋于10:15在3号楼大堂长椅上被遗落。'], 'dataset_id': '9403e96c-b3b6-55f8-a052-06211dc305ce', 'dataset_name': 'main_dataset', 'dataset_tenant_id': None}
 ```
-可以看到，回答十分混乱。对于三个难度层级都没有回答正确。**分析后发现是向量模型不支持中文语义**的原因。采用**英文**的记忆输入和提问后，测试结果如下。
+execute_workflow()
+  │
+  ├─ _prepare()                     ← 准备工作
+  │   ├─ ensure_valid_tasks()       ← 验证 Stage 列表是否合法
+  │   ├─ prepare_backends()         ← 初始化后端（图数据库、向量数据库）
+  │   └─ authorize_datasets()       ← 鉴权 + 解析数据集
+  │
+  └─ _execute_for_dataset()         ← 对每个数据集执行
+      ├─ fetch_dataset_items()      ← 获取数据集中已有的 Data 记录
+      ├─ check_cache_status()       ← 检查缓存，避免重复处理
+      │
+      └─ run_tasks()                ← 按序执行所有 Stage
+          ├─ _init_run()            ← 注册 pipeline run 记录
+          │
+          └─ _process_batches()     ← ★ 分批处理数据
+              ├─ 分批（默认每批 20 个）
+              ├─ 并发控制
+              │
+              └─ 对每个 item 执行所有 Stage
 ```
-===============================================
-Question: What item did P-101 carry at 09:15?(except answer:brown paper bag)
-Answer: ['brown paper bag']
 
-===============================================
-Question: Who is the most likely owner of the brown paper bag left on the bench in Building 3?(except answer:P-101)
-Answer: ['The most likely owner of the brown paper bag is P-101, who was observed carrying it at the East Gate at 09:15 and was last seen in Building 3 lobby at 10:00 without the bag.']
+### 2.3 各步骤职责
 
-===============================================
-Question: In what time window was the brown paper bag lost or misplaced?(except answer:09:15 to 10:00)
-Answer: ['The brown paper bag was likely lost or misplaced between 09:15 and 10:15 on May 26, 2026.']
+| 步骤 | 职责 |
+|------|------|
+| `ensure_valid_tasks()` | 检查 Stage 列表是否合法（非空、函数可调用等） |
+| `prepare_backends()` | 初始化图数据库和向量数据库的连接 |
+| `authorize_datasets()` | 按名称查找数据集，找不到就创建；检查用户写权限 |
+| `fetch_dataset_items()` | 查询数据集中已有的所有 Data 记录 |
+| `check_cache_status()` | 检查是否已处理过，启用缓存时跳过已完成的数据集 |
+| `_init_run()` | 在数据库中创建 PipelineRun 记录，标记运行开始 |
+| `_process_batches()` | 将数据分批，逐批执行所有 Stage |
+| `record_run_finish()` | 更新 PipelineRun 状态为完成 |
+| `_flush_remote_storage()` | 如果适配器支持，将本地数据同步到远程存储 |
+
+---
+
+## 三、分批处理机制
+
+### 3.1 为什么需要分批？
+
+```python
+# 坏的设计：不分批，全量并行
+coros = [process(item) for item in all_10000_items]
+await asyncio.gather(*coros)
+# → 同时开 10,000 个数据库连接，数据库直接崩溃
+
+# 好的设计：分批 + 限流
+for batch in chunks(items, 20):       # 每批 20 个
+    coros = [process(item) for item in batch]
+    await run_with_concurrency_limit(coros, 20)  # 最多 20 并发
+# → 任何时候最多 20 个数据库连接，安全可控
 ```
-可以看到，只在最难的第三个问题上出现了一点错误。模型的能力是值得认可的，但是要达到更加可靠的复杂时空推理需求，还需要深度的个性化定制。
-### test3-多模式测试
-因为模型具有五种不同的推理模式。我将五种模式都轮流用了一遍，测试上一个部分相同的问题。测试结果如下：
-问题1：
+
+### 3.2 分批实现
+
+```python
+async def _process_batches(ctx, tasks, context, incremental_loading, items_per_batch):
+    items = ctx.data if isinstance(ctx.data, list) else [ctx.data]
+
+    if incremental_loading:
+        items = await resolve_data_directories(items)  # 展开目录
+
+    total = len(items)
+    limit = get_pipeline_concurrency_limit()            # 获取并发限制
+
+    for offset in range(0, len(items), items_per_batch):  # 分批
+        batch = items[offset : offset + items_per_batch]
+
+        coros = [
+            process_data_items(item, ctx.dataset, tasks, ...)
+            for item in batch
+        ]
+
+        batch_results = await run_with_concurrency_limit(coros, limit)
 ```
-Question: What item did P-101 carry at 09:15?
 
-=== Mode: EPISODIC ===
-Returned 1 result(s):
-[1] ['brown paper bag']
+| 参数 | 默认值 | 作用 |
+|------|:------:|------|
+| `items_per_batch` | 20 | 每批处理的数据项数量 |
 
-=== Mode: PROCEDURAL ===
-Returned 1 result(s):
-[1] ['The context lacks sufficient information to answer this question.']
+**分批的目的**：
+- **内存控制** — 避免一次性加载所有数据到内存
+- **进度跟踪** — 每批更新一次进度，可显示 "已处理 40/10000"
+- **错误隔离** — 一批失败不影响其他批次
 
-=== Mode: TRIPLET_COMPLETION ===
-Returned 1 result(s):
-[1] ['brown paper bag']
+---
 
-=== Mode: CHUNKS_LEXICAL ===
-Returned 1 result(s):
-[1] [[{'name': '', 'type': 'ContentFragment', 'version': 1, 'metadata': {'index_fields': ['text'], 'sentence_classifications': [{'sentence_idx': 0, 'text': 'Time: 09:15 | Location: East Gate | Pedestrian: P-101 | Features: Male, blue hoodie | Carried item: brown paper bag.', 'routing_type': 'atomic', 'event_id': 'atomic_1ce722f7-be28-5296-bb20-79839ad09225_0_441a30', 'event_topic': '[Atomic] Time: 09:15 | Location: East Gate | Pedestrian: P-...', 'event_focus': 'Short single sentence - atomic processing'}]}, 'schema_aligned': False, 'graph_depth': 0, 'memory_spaces': None, 'mentioned_time_start_ms': None, 'mentioned_time_end_ms': None, 'mentioned_time_confidence': None, 'mentioned_time_text': None, 'text': 'Time: 09:15 | Location: East Gate | Pedestrian: P-101 | Features: Male, blue hoodie | Carried item: brown paper bag.', 'chunk_size': 53, 'chunk_index': 0, 'cut_type': 'sentence_end', 'contains': [], 'created_at': 1779808247298, 'updated_at': 1779837087507}, {'name': '', 'type': 'ContentFragment', 'version': 1, 'metadata': {'index_fields': ['text'], 'sentence_classifications': [{'sentence_idx': 0, 'text': 'Time: 10:00 | Location: Building 3 Lobby | Pedestrian: P-101 | Features: Blue hoodie | Carried item: None.', 'routing_type': 'atomic', 'event_id': 'atomic_ce57f751-9be5-52f2-b338-a08cf89871f0_0_e24ca1', 'event_topic': '[Atomic] Time: 10:00 | Location: Building 3 Lobby | Pedestr...', 'event_focus': 'Short single sentence - atomic processing'}]}, 'schema_aligned': False, 'graph_depth': 0, 'memory_spaces': None, 'mentioned_time_start_ms': None, 'mentioned_time_end_ms': None, 'mentioned_time_confidence': None, 'mentioned_time_text': None, 'text': 'Time: 10:00 | Location: Building 3 Lobby | Pedestrian: P-101 | Features: Blue hoodie | Carried item: None.', 'chunk_size': 48, 'chunk_index': 0, 'cut_type': 'sentence_end', 'contains': [], 'created_at': 1779808247813, 'updated_at': 1779837104285}, {'name': '', 'type': 'ContentFragment', 'version': 1, 'metadata': {'index_fields': ['text'], 'sentence_classifications': [{'sentence_idx': 0, 'text': 'Time: 10:15 | Location: Building 3 Lobby | Unattended item found: A brown paper bag left on the bench.', 'routing_type': 'atomic', 'event_id': 'atomic_d93cef27-b772-5185-ad68-2d34e5aeb578_0_b46363', 'event_topic': '[Atomic] Time: 10:15 | Location: Building 3 Lobby | Unatten...', 'event_focus': 'Short single sentence - atomic processing'}]}, 'schema_aligned': False, 'graph_depth': 0, 'memory_spaces': None, 'mentioned_time_start_ms': None, 'mentioned_time_end_ms': None, 'mentioned_time_confidence': None, 'mentioned_time_text': None, 'text': 'Time: 10:15 | Location: Building 3 Lobby | Unattended item found: A brown paper bag left on the bench.', 'chunk_size': 45, 'chunk_index': 0, 'cut_type': 'sentence_end', 'contains': [], 'created_at': 1779808248306, 'updated_at': 1779837114778}, {'name': '', 'type': 'ContentFragment', 'version': 1, 'metadata': {'index_fields': ['text'], 'sentence_classifications': [{'sentence_idx': 0, 'text': 'Time: 10:30 | Location: Building 3 Lobby | Pedestrian: P-102 | Features: Female, yellow jacket | Carried item: took the brown paper bag from the bench.', 'routing_type': 'episodic', 'event_id': 'evt_824c6da1-7254-5990-84a9-abb067d000bc_52f37696', 'event_topic': 'Single sentence content', 'event_focus': 'Single sentence - direct episodic processing'}]}, 'schema_aligned': False, 'graph_depth': 0, 'memory_spaces': None, 'mentioned_time_start_ms': None, 'mentioned_time_end_ms': None, 'mentioned_time_confidence': None, 'mentioned_time_text': None, 'text': 'Time: 10:30 | Location: Building 3 Lobby | Pedestrian: P-102 | Features: Female, yellow jacket | Carried item: took the brown paper bag from the bench.', 'chunk_size': 66, 'chunk_index': 0, 'cut_type': 'sentence_end', 'contains': [], 'created_at': 1779808248772, 'updated_at': 1779837073471}]]
+## 四、并发控制机制
 
-=== Mode: CYPHER ===
-Error during search: CypherExecutionError CypherExecutionError: Cypher query execution failed. (Status code: 400)
+### 4.1 三种执行模式
+
+```python
+async def run_with_concurrency_limit(coros, concurrency_limit=None):
+    limit = concurrency_limit or get_pipeline_concurrency_limit()
+
+    if limit == 1:
+        # 模式一：串行执行
+        for coro in coros:
+            result = await coro
+
+    elif limit >= len(coros):
+        # 模式二：全并行
+        return await asyncio.gather(*coros)
+
+    else:
+        # 模式三：信号量限制并行
+        semaphore = asyncio.Semaphore(limit)
+        async def limited_coro(coro):
+            async with semaphore:
+                return await coro
+        return await asyncio.gather(*[limited_coro(c) for c in coros])
 ```
-问题2
+
+#### 模式一：串行执行（limit = 1）
+
 ```
-Question: Who is the most likely owner of the brown paper bag left on the bench in Building 3?
-
-=== Mode: EPISODIC ===
-Returned 1 result(s):
-[1] ['The most likely owner is Pedestrian P-101, who was seen carrying a brown paper bag at 09:15 and then in Building 3 lobby without it at 10:00, shortly before the bag was found unattended.']
-
-=== Mode: PROCEDURAL ===
-Returned 1 result(s):
-[1] ['Insufficient context to determine the owner of the brown paper bag.']
-
-=== Mode: TRIPLET_COMPLETION ===
-Returned 1 result(s):
-[1] ['The context does not provide any information about who might own the bag; it only states that an unattended bag was found.']
-
-=== Mode: CHUNKS_LEXICAL ===
-Returned 1 result(s):
-[1] [[{'name': '', 'type': 'ContentFragment', 'version': 1, 
-......(此处省略很多，和问题1一样)
-sentence_end', 'contains': [], 'created_at': 1779808247813, 'updated_at': 1779837104285}]]
-
-=== Mode: CYPHER ===
-Error during search: CypherExecutionError CypherExecutionError: Cypher query execution failed. (Status code: 400)
+时间 →
+item1 ──┤
+item2    ──┤
+item3      ──┤
 ```
-问题3
+
+**适用场景**：SQLite 数据库。SQLite 是文件级锁，同时写会报 `database is locked`。
+
+#### 模式二：全并行（limit >= 数量）
+
 ```
-Question: In what time window was the brown paper bag lost or misplaced?
-
-=== Mode: EPISODIC ===
-Returned 1 result(s):
-[1] ['The bag was lost between 09:15 and 10:00, and was found unattended at 10:15.']
-
-=== Mode: PROCEDURAL ===
-Returned 1 result(s):
-[1] ['The provided context does not contain any information about a brown paper bag or its loss, so it is not possible to determine the time window.']
-
-=== Mode: TRIPLET_COMPLETION ===
-Returned 1 result(s):
-[1] ['The context only indicates that the brown paper bag was found unattended at 10:15, not the time it was lost or misplaced.']
-
-=== Mode: CHUNKS_LEXICAL ===
-Returned 1 result(s):
-[1] [[{'name': '', 'type': 'ContentFragment', 'version': 1,  
-（此处省略很多）.....
-'created_at': 1779808247813, 'updated_at': 1779837104285}]]
-
-=== Mode: CYPHER ===
-Error during search: CypherExecutionError CypherExecutionError: Cypher query execution failed. (Status code: 400)
+时间 →
+item1 ──────────────────┤
+item2 ──────────────────┤  ← 同时开始，同时结束
+item3 ──────────────────┤
 ```
-**可以看出，各种模式的使用还需要进行个性化配置**，并不能达到开箱即用。
 
-## 部署时候遇到的问题（避坑指南）
+**适用场景**：PostgreSQL + 当前批数量小于并发限制。
 
-### **Docker 与网络环境依赖**：
-M-Flow 官方提供了基于 Docker Compose 的一键部署脚本（如 `quickstart.sh`），但对于国内开发者，在拉取官方 DockerHub 镜像（如 `python:3.12-slim-bookworm` 和 `node:20-alpine`）时，我遭遇 DNS 解析错误和超时报错（如 `dial tcp: lookup registry-1.docker.io...`）。因此体验其给出的UI界面简洁化部署失败了。
-### **Pip 代理冲突**
-根据其官方文档，其部署方式是采用`pip install m_flow`的指令。
-但我实际进行部署的时候，发现找不到相应的包。而是采用`pip install mflow-ai`才安装成功的。
-### 配置文件（.env）解析歧义与校验失败
-在配置 `VECTOR_DB_URL=` 后紧跟空格及井号注释时，Pydantic 报错 `ValidationError` 提示需要绝对路径。
- **解决**：由于 M-Flow 内置的某些文件解析器处理不严谨，会将未用双引号包裹的尾随注释误识别为变量的实际参数。需将 `VECTOR_DB_URL` 显式设置为空字符串（即 `VECTOR_DB_URL=""`）并移除尾随注释。
+#### 模式三：信号量限制并行（1 < limit < 数量）
 
-### 大模型（LLM）调用与“深度思考”模式冲突
-*   **现象**：当使用集成了 DeepSeek 最新模型的 API 端点（如 `api.deepseek.com`），且设置 `LLM_INSTRUCTOR_MODE="tool_call"` 时，程序频繁报错 `litellm.BadRequestError: Thinking mode does not support this tool_choice`。
-*   **原因与解决**：
-    这是大模型技术演进引发的最典型前沿冲突。DeepSeek 等新型大模型默认开启了“深度思考模式（Thinking Mode）”，而该模式在协议上**不支持强制工具调用（Forced tool_choice）** 。
-    *   **解决方案**：将 `LLM_INSTRUCTOR_MODE` 修改为 **`"json_mode"`** 。这样系统会改用兼容思考链的标准 JSON 对象（`json_object`）输出形式，在保证思考推理深度的同时避开协议冲突 。
-    
-### 向量嵌入（Embedding）缺省造成的程序死锁
-*   **现象**：大模型自检通过后，程序运行到 `Default permissions initialized` 处无任何日志输出，呈现长期卡死/死锁状态。
-*   **原因与解决**：
-    若用户仅配置了 LLM 密钥而未声明 Embedding 配置，系统会默认尝试用同一个 API 端点和 Key 去请求默认的 OpenAI 嵌入接口 。而类似 DeepSeek 的官方接口并不提供向量嵌入（`/v1/embeddings`）服务，导致底层请求失败。由于 `tenacity` 自动重试机制的存在，系统开始进行无报错的静默无限重试 。
-    *   **解决方案**：引入本地运行且不需要 API 密钥的 **`fastembed`** 库，将 `EMBEDDING_PROVIDER` 指定为 `"fastembed"` 。
-    *   **避坑防崩**：`fastembed` 默认调用的 `BAAI/bge-small-en-v1.5` 输出维度是 **384 维**，必须将 `.env` 里的 `EMBEDDING_DIMENSIONS` 同步修改为 `384`（而不是 OpenAI 的 3072）。否则，LanceDB 数据库写入时将因维度冲突彻底崩溃。
+```
+时间 →
+item1  ──────────┤
+item2  ──────────┤
+...               ← 同时最多 N 个
+itemN  ──────────┤
+itemN+1 ──────────┤  ← 等前面有空位再开始
+itemN+2 ──────────┤
+```
 
-### 中文环境语义漂移
-*   **现象**：用中文记录测试时，系统经常回答“未找到相关信息”。
-*   **原因与解决**：
-    默认使用的 `bge-small-en-v1.5` 是纯英文向量模型。
-    *   **解决方案 1**：将 `.env` 的向量模型替换为多语言模型，如 `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`（输出同样为 384 维，无需修改维度）。
-    *   **解决方案 2（学术推荐）**：由于底层关系抽取的系统 Prompts 是英文，最稳妥、能最大化发挥 M-Flow 时空关联逻辑的设计是将**输入数据流与提问全部转化为英文运行**，规避因中英语义漂移产生的抽取失败。
+**适用场景**：PostgreSQL，默认 limit=20。
+
+### 4.2 并发数决定逻辑
+
+```python
+def get_pipeline_concurrency_limit():
+    # 1. 环境变量覆盖
+    override = os.getenv("MFLOW_PIPELINE_CONCURRENCY")
+    if override and int(override) > 0:
+        return int(override)
+
+    # 2. 自动检测数据库类型
+    provider = _detect_db_provider()
+    if provider == "sqlite":
+        return 1       # SQLite → 串行
+    elif provider in ("postgres", "postgresql"):
+        return 20      # PostgreSQL → 20 并发
+    else:
+        return 1       # 未知 → 保守串行
+```
+
+| 数据库 | 默认并发数 | 原因 |
+|--------|:---------:|------|
+| SQLite | 1 | 文件级锁，并发写会崩 |
+| PostgreSQL | 20 | 成熟的关系型数据库，支持高并发 |
+| 其他 | 1 | 保守策略 |
+
+可通过环境变量覆盖：
+```bash
+export MFLOW_PIPELINE_CONCURRENCY=50  # 强制 50 并发
+```
+
+### 4.3 两层控制关系
+
+```
+总数据量：10,000 个文件
+  │
+  ├─ 分批：每批 20 个 → 共 500 批
+  │
+  └─ 每批内部：并发控制
+       ├─ SQLite：20 个文件串行处理（1 个 1 个来）
+       └─ PostgreSQL：20 个文件并行处理（最多 20 个同时）
+```
+
+---
+
+## 五、Stage 的执行方式
+
+### 5.1 `process_data_items()` — 对单个 item 执行所有 Stage
+
+每个 item 会依次经过 Pipeline 中定义的所有 Stage：
+
+```python
+# 伪代码逻辑
+async def process_data_items(item, dataset, tasks, ...):
+    current_input = item
+
+    for stage in tasks:           # 遍历所有 Stage
+        result = await stage.execute(current_input)  # 执行当前 Stage
+        current_input = result    # 输出作为下一个 Stage 的输入
+
+    return current_input
+```
+
+### 5.2 Stage 链的数据流
+
+```
+item ──→ Stage 1 ──→ Stage 2 ──→ Stage 3 ──→ 最终结果
+         (预处理)    (核心处理)   (后处理)
+```
+
+每个 Stage 的输出作为下一个 Stage 的输入，形成处理链。
+
+---
+
+## 六、典型 Pipeline 示例
+
+### 6.1 `add` Pipeline（数据摄入）
+
+```python
+tasks = [
+    Stage(resolve_data_directories, include_subdirectories=True),
+    Stage(ingest_data, ds_name, usr, nodes, ds_id, loader_cfg, created_at_ms),
+]
+```
+
+### 6.2 `memorize` Pipeline（记忆化处理）
+
+```python
+tasks = [
+    Stage(chunk_documents),           # 分块
+    Stage(generate_embeddings),       # 向量化
+    Stage(extract_knowledge),         # 知识抽取
+    Stage(save_to_graph_db),          # 存图库
+]
+```
+
+### 6.3 自定义 Pipeline
+
+```python
+from m_flow.pipeline import Stage, execute_workflow
+
+custom_tasks = [
+    Stage(load_data),
+    Stage(transform),
+    Stage(analyze),
+    Stage(save_results),
+]
+
+async for result in execute_workflow(
+    tasks=custom_tasks,
+    datasets="我的数据集",
+    user=current_user,
+    name="自定义管线",
+):
+    print(f"进度: {result}")
+```
+
+---
+
+## 七、设计要点总结
+
+| 方面 | 说明 |
+|------|------|
+| **Stage 本质** | 统一的任务包装器，将任意函数标准化为统一接口 |
+| **Stage 参数预置** | 通过 `*defaults` 和 `**kw_defaults` 预置参数，运行时只需传入 data |
+| **Pipeline 本质** | Stage 的有序列表，按顺序依次执行 |
+| **分批处理** | 默认每批 20 个，控制内存和进度 |
+| **并发控制** | 自动检测数据库类型，SQLite 串行，PostgreSQL 20 并发 |
+| **可扩展性** | 任何函数都可以包装成 Stage，自由组合成 Pipeline |

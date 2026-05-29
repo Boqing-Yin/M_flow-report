@@ -9,7 +9,7 @@ hero:
   actions:
     - theme: brand
       text: 详细报告
-      link: /report/chapter1.md
+      link: /report/chapter1
 
 
 

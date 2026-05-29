@@ -4,6 +4,7 @@ export default defineConfig({
   base: '/M_flow-report/',
   title: "m_flow report",
   description: "这是一份关于m_flow仓库的调研报告",
+  ignoreDeadLinks: true,
   themeConfig: {
     nav: [
       { text: '首页', link: '/' },
